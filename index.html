@@ -1,207 +1,215 @@
-<!DOCTYPE html>
+ <!doctype html>
 <html lang="pt-BR">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
-    <meta http-equiv="Pragma" content="no-cache">
-    <meta http-equiv="Expires" content="0">
-    <title>Jampa GPS para OBS</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Jampa GPS 2.0</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --fonte-principal: Arial, Helvetica, sans-serif;
+    }
 
-    <style>
-        html,
-        body {
-            width: 100%;
-            height: 100%;
-            margin: 0;
-            overflow: hidden;
-            background: transparent;
-        }
+    * {
+      box-sizing: border-box;
+    }
 
-        body {
-            font-family: Arial, sans-serif;
-            color: #ffffff;
-        }
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: transparent;
+    }
 
-        #localizacao {
-            display: none;
-            align-items: center;
-            gap: 10px;
-            font-size: 24px;
-            font-weight: 700;
-            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
-        }
-    </style>
+    body {
+      display: flex;
+      align-items: flex-end;
+      justify-content: flex-start;
+      padding: clamp(18px, 3vw, 56px);
+      font-family: var(--fonte-principal);
+    }
+
+    #painel {
+      display: inline-flex;
+      align-items: center;
+      gap: clamp(22px, 3vw, 54px);
+      max-width: calc(100vw - 36px);
+      padding: 14px 22px;
+      opacity: 0;
+      transform: translateY(14px);
+      transition: opacity 700ms ease, transform 700ms ease;
+      pointer-events: none;
+      white-space: nowrap;
+      text-shadow:
+        0 3px 3px rgba(0, 0, 0, 0.98),
+        0 0 8px rgba(0, 0, 0, 0.98),
+        0 0 18px rgba(0, 0, 0, 0.95);
+      filter: drop-shadow(0 3px 3px rgba(0, 0, 0, 0.9));
+    }
+
+    #painel.visivel {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .grupo {
+      display: inline-flex;
+      align-items: center;
+      gap: clamp(8px, 1vw, 16px);
+      min-width: 0;
+    }
+
+    .icone {
+      flex: 0 0 auto;
+      font-size: clamp(56px, 5.2vw, 76px);
+      line-height: 1;
+    }
+
+    .texto {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: #ffffff;
+      font-size: clamp(54px, 5vw, 68px);
+      font-weight: 800;
+      line-height: 1;
+      letter-spacing: -1.5px;
+    }
+
+    #temperaturaGrupo[hidden] {
+      display: none;
+    }
+
+    @media (max-width: 760px) {
+      body {
+        padding: 18px;
+      }
+
+      #painel {
+        gap: 18px;
+        padding: 10px 12px;
+      }
+
+      .icone {
+        font-size: clamp(38px, 9vw, 58px);
+      }
+
+      .texto {
+        font-size: clamp(36px, 8.5vw, 58px);
+        letter-spacing: -0.8px;
+      }
+    }
+  </style>
 </head>
 <body>
-    <div id="localizacao">
-        <span>📍</span>
-        <span id="bairro"></span>
-        <span id="icone-temperatura">🌡️</span>
-        <span id="temperatura"></span>
+  <div id="painel" aria-live="polite">
+    <div class="grupo" id="bairroGrupo">
+      <span class="icone" aria-hidden="true">📍</span>
+      <span class="texto" id="bairro">Localização atual</span>
     </div>
 
-    <script>
-        'use strict';
+    <div class="grupo" id="temperaturaGrupo" hidden>
+      <span class="icone" aria-hidden="true">🌡️</span>
+      <span class="texto" id="temperatura"></span>
+    </div>
+  </div>
 
-        const URL_RENDER = 'wss://jampa-gps.onrender.com';
-        const container = document.getElementById('localizacao');
-        const campoBairro = document.getElementById('bairro');
-        const campoTemperatura = document.getElementById('temperatura');
-        const iconeTemperatura = document.getElementById('icone-temperatura');
+  <script>
+    'use strict';
 
-        let socket = null;
-        let reconexaoId = null;
-        let pingId = null;
-        let vigilanciaId = null;
-        let ultimaResposta = 0;
+    const ATRASO_EXIBICAO_MS = 15_000;
+    const TEMPO_SEM_GPS_MS = 60_000;
 
-        function esconderTudo() {
-            container.style.display = 'none';
-            campoBairro.textContent = '';
-            campoTemperatura.textContent = '';
-            iconeTemperatura.style.display = 'none';
+    const painel = document.getElementById('painel');
+    const bairroElemento = document.getElementById('bairro');
+    const temperaturaGrupo = document.getElementById('temperaturaGrupo');
+    const temperaturaElemento = document.getElementById('temperatura');
+
+    let socket = null;
+    let temporizadorExibicao = null;
+    let temporizadorOcultar = null;
+    let reconexao = null;
+    let ultimoDado = null;
+
+    function urlWebSocket() {
+      const protocolo = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${protocolo}//${location.host}`;
+    }
+
+    function cancelarTemporizadores() {
+      clearTimeout(temporizadorExibicao);
+      clearTimeout(temporizadorOcultar);
+      temporizadorExibicao = null;
+      temporizadorOcultar = null;
+    }
+
+    function ocultarPainel() {
+      painel.classList.remove('visivel');
+    }
+
+    function preencherPainel(dado) {
+      const bairro = typeof dado.bairro === 'string' ? dado.bairro.trim() : '';
+      bairroElemento.textContent = bairro || 'Localização atual';
+
+      const temperatura = Number(dado.temperatura);
+      if (Number.isFinite(temperatura)) {
+        temperaturaElemento.textContent = `${Math.round(temperatura)}°C`;
+        temperaturaGrupo.hidden = false;
+      } else {
+        temperaturaElemento.textContent = '';
+        temperaturaGrupo.hidden = true;
+      }
+    }
+
+    function agendarExibicao(dado) {
+      ultimoDado = dado;
+      cancelarTemporizadores();
+      ocultarPainel();
+
+      temporizadorExibicao = setTimeout(() => {
+        preencherPainel(ultimoDado);
+        painel.classList.add('visivel');
+      }, ATRASO_EXIBICAO_MS);
+
+      temporizadorOcultar = setTimeout(() => {
+        ocultarPainel();
+      }, TEMPO_SEM_GPS_MS);
+    }
+
+    function conectar() {
+      clearTimeout(reconexao);
+
+      try {
+        socket = new WebSocket(urlWebSocket());
+      } catch (erro) {
+        reconexao = setTimeout(conectar, 3000);
+        return;
+      }
+
+      socket.addEventListener('message', (evento) => {
+        try {
+          const dado = JSON.parse(evento.data);
+          if (dado?.tipo === 'localizacao' && dado.bairro) {
+            agendarExibicao(dado);
+          }
+        } catch (erro) {
+          console.error('Mensagem WebSocket inválida:', erro);
         }
+      });
 
-        function mostrarDados(bairro, temperatura) {
-            const bairroSeguro = typeof bairro === 'string' ? bairro.trim() : '';
-            const temperaturaSegura =
-                typeof temperatura === 'string' ? temperatura.trim() : '';
+      socket.addEventListener('close', () => {
+        ocultarPainel();
+        reconexao = setTimeout(conectar, 3000);
+      });
 
-            if (!bairroSeguro && !temperaturaSegura) {
-                esconderTudo();
-                return;
-            }
+      socket.addEventListener('error', () => {
+        socket.close();
+      });
+    }
 
-            campoBairro.textContent = bairroSeguro;
-            campoTemperatura.textContent = temperaturaSegura;
-            iconeTemperatura.style.display = temperaturaSegura ? 'inline' : 'none';
-            container.style.display = 'flex';
-        }
-
-        function obterUrlWebSocket() {
-            if (window.location.protocol === 'https:') {
-                return `wss://${window.location.host}`;
-            }
-
-            if (window.location.protocol === 'http:') {
-                return `ws://${window.location.host}`;
-            }
-
-            // Proteção adicional caso o arquivo seja aberto localmente no OBS.
-            return URL_RENDER;
-        }
-
-        function pararTemporizadores() {
-            if (pingId) {
-                clearInterval(pingId);
-                pingId = null;
-            }
-
-            if (vigilanciaId) {
-                clearInterval(vigilanciaId);
-                vigilanciaId = null;
-            }
-        }
-
-        function agendarReconexao() {
-            if (reconexaoId) {
-                return;
-            }
-
-            reconexaoId = setTimeout(() => {
-                reconexaoId = null;
-                conectar();
-            }, 3000);
-        }
-
-        function iniciarVigilancia() {
-            pararTemporizadores();
-
-            pingId = setInterval(() => {
-                if (socket && socket.readyState === WebSocket.OPEN) {
-                    socket.send('PING');
-                }
-            }, 20_000);
-
-            vigilanciaId = setInterval(() => {
-                if (!socket || !ultimaResposta) {
-                    return;
-                }
-
-                if (Date.now() - ultimaResposta > 50_000) {
-                    socket.close();
-                }
-            }, 5_000);
-        }
-
-        function conectar() {
-            if (
-                socket &&
-                (socket.readyState === WebSocket.OPEN ||
-                 socket.readyState === WebSocket.CONNECTING)
-            ) {
-                return;
-            }
-
-            const url = obterUrlWebSocket();
-            console.log('[OBS] Conectando em:', url);
-            socket = new WebSocket(url);
-
-            socket.onopen = () => {
-                console.log('[OBS] WebSocket conectado.');
-                ultimaResposta = Date.now();
-                socket.send('PING');
-                iniciarVigilancia();
-            };
-
-            socket.onmessage = event => {
-                ultimaResposta = Date.now();
-
-                try {
-                    const dados = JSON.parse(event.data);
-
-                    if (dados.tipo === 'PONG') {
-                        return;
-                    }
-
-                    if (dados.tipo === 'LIMPAR_TELA') {
-                        esconderTudo();
-                        return;
-                    }
-
-                    if (
-                        dados.tipo === 'STATUS' ||
-                        dados.tipo === 'MOSTRAR' ||
-                        dados.tipo === 'ATUALIZAR'
-                    ) {
-                        mostrarDados(dados.bairro, dados.temperatura);
-                    }
-                } catch (erro) {
-                    console.error('[OBS] Mensagem inválida:', erro);
-                }
-            };
-
-            socket.onerror = erro => {
-                console.error('[OBS] Erro WebSocket:', erro);
-                try {
-                    socket.close();
-                } catch (_) {
-                    agendarReconexao();
-                }
-            };
-
-            socket.onclose = () => {
-                console.log('[OBS] Desconectado. Reconectando em 3 segundos.');
-                pararTemporizadores();
-                socket = null;
-                esconderTudo();
-                agendarReconexao();
-            };
-        }
-
-        esconderTudo();
-        conectar();
-    </script>
+    conectar();
+  </script>
 </body>
 </html>
