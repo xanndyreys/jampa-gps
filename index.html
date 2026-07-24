@@ -153,8 +153,13 @@
       const bairro = typeof dado.bairro === 'string' ? dado.bairro.trim() : '';
       bairroElemento.textContent = bairro || 'Localização atual';
 
+      const temperaturaDisponivel =
+        dado.temperatura !== null &&
+        dado.temperatura !== undefined &&
+        dado.temperatura !== '';
       const temperatura = Number(dado.temperatura);
-      if (Number.isFinite(temperatura)) {
+
+      if (temperaturaDisponivel && Number.isFinite(temperatura)) {
         temperaturaElemento.textContent = `${Math.round(temperatura)}°C`;
         temperaturaGrupo.hidden = false;
       } else {
