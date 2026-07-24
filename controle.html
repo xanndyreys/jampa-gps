@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>Controle GPS - Jampa na Orla 2</title>
+
+    <style>
+        * { box-sizing: border-box; }
+
+        html, body {
+            min-height: 100%;
+            margin: 0;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            background: #101820;
+            color: #ffffff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 22px;
+        }
+
+        .painel {
+            width: 100%;
+            max-width: 430px;
+            background: #182630;
+            border-radius: 18px;
+            padding: 26px;
+            box-shadow: 0 12px 35px rgba(0, 0, 0, 0.45);
+            text-align: center;
+        }
+
+        h1 {
+            margin: 0 0 8px;
+            font-size: 27px;
+        }
+
+        .subtitulo {
+            margin: 0 0 22px;
+            color: #b9c8d1;
+            font-size: 15px;
+        }
+
+        #status {
+            min-height: 92px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 7px;
+            padding: 15px;
+            margin-bottom: 18px;
+            border-radius: 12px;
+            background: #0e171d;
+            line-height: 1.35;
+        }
+
+        .estado {
+            font-size: 18px;
+            font-weight: 700;
+        }
+
+        .detalhe {
+            color: #b9c8d1;
+            font-size: 14px;
+        }
+
+        button {
+            width: 100%;
+            border: 0;
+            border-radius: 12px;
+            padding: 16px;
+            font-size: 18px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        #botao {
+            background: #21d19f;
+            color: #07110e;
+        }
+
+        #botao.ativo {
+            background: #ff5f5f;
+            color: #ffffff;
+        }
+
+        #botao:disabled {
+            opacity: 0.65;
+            cursor: default;
+        }
+
+        .aviso {
+            margin: 17px 0 0;
+            color: #b9c8d1;
+            font-size: 13px;
+            line-height: 1.45;
+        }
+    </style>
+</head>
+<body>
+    <main class="painel">
+        <h1>📍 Controle GPS</h1>
+        <p class="subtitulo">Jampa na Orla 2</p>
+
+        <section id="status" aria-live="polite">
+            <div class="estado">Rastreamento desligado</div>
+            <div class="detalhe">Toque no botão para iniciar.</div>
+        </section>
+
+        <button id="botao" type="button">Ligar rastreamento</button>
+
+        <p class="aviso">
+            Mantenha esta página aberta durante a live. O local só aparecerá no OBS
+            após 15 segundos de sinal contínuo.
+        </p>
+    </main>
+
+    <script>
+        'use strict';
+
+        const botao = document.getElementById('botao');
+        const status = document.getElementById('status');
+
+        const INTERVALO_REENVIO = 20_000;
+
+        let rastreamentoAtivo = false;
+        let watchId = null;
+        let reenvioId = null;
+        let ultimaPosicao = null;
+        let wakeLock = null;
+        let envioEmAndamento = false;
+
+        function mostrarStatus(titulo, detalhe) {
+            status.innerHTML = '';
+
+            const linhaTitulo = document.createElement('div');
+            linhaTitulo.className = 'estado';
+            linhaTitulo.textContent = titulo;
+
+            const linhaDetalhe = document.createElement('div');
+            linhaDetalhe.className = 'detalhe';
+            linhaDetalhe.textContent = detalhe;
+
+            status.append(linhaTitulo, linhaDetalhe);
+        }
+
+        function descricaoErroGPS(erro) {
+            if (!erro) return 'Não foi possível acessar o GPS.';
+            if (erro.code === 1) return 'Permissão de localização negada.';
+            if (erro.code === 2) return 'Sinal de localização indisponível.';
+            if (erro.code === 3) return 'O GPS demorou demais para responder.';
+            return erro.message || 'Erro desconhecido no GPS.';
+        }
+
+        async function manterTelaAcordada() {
+            if (!('wakeLock' in navigator)) return;
+
+            try {
+                wakeLock = await navigator.wakeLock.request('screen');
+                wakeLock.addEventListener('release', () => {
+                    wakeLock = null;
+                });
+            } catch (_) {
+                wakeLock = null;
+            }
+        }
+
+        async function enviarPosicao(posicao) {
+            if (!rastreamentoAtivo || !posicao || envioEmAndamento) return;
+
+            envioEmAndamento = true;
+
+            const lat = posicao.coords.latitude;
+            const lon = posicao.coords.longitude;
+            const precisao = Math.round(posicao.coords.accuracy || 0);
+
+            try {
+                const resposta = await fetch('/api/atualizar', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    cache: 'no-store',
+                    body: JSON.stringify({
+                        lat,
+                        lon,
+                        temperatura: ''
+                    })
+                });
+
+                const resultado = await resposta.json();
+
+                if (!resposta.ok) {
+                    throw new Error(resultado.mensagem || 'Servidor recusou a localização.');
+                }
+
+                mostrarStatus(
+                    'GPS enviando ao vivo',
+                    `${resultado.bairro} • precisão aproximada: ${precisao} m`
+                );
+            } catch (erro) {
+                mostrarStatus(
+                    'GPS obtido, mas o envio falhou',
+                    erro.message || 'Verifique a internet do celular.'
+                );
+            } finally {
+                envioEmAndamento = false;
+            }
+        }
+
+        function aoReceberPosicao(posicao) {
+            ultimaPosicao = posicao;
+            enviarPosicao(posicao);
+        }
+
+        function aoFalharGPS(erro) {
+            mostrarStatus('Não foi possível iniciar', descricaoErroGPS(erro));
+        }
+
+        async function iniciar() {
+            if (!navigator.geolocation) {
+                mostrarStatus('GPS não disponível', 'Este navegador não oferece geolocalização.');
+                return;
+            }
+
+            rastreamentoAtivo = true;
+            botao.disabled = true;
+            botao.classList.add('ativo');
+            botao.textContent = 'Desligar rastreamento';
+            mostrarStatus('Buscando sinal de GPS...', 'Autorize a localização quando o celular solicitar.');
+
+            await manterTelaAcordada();
+
+            watchId = navigator.geolocation.watchPosition(
+                aoReceberPosicao,
+                aoFalharGPS,
+                {
+                    enableHighAccuracy: true,
+                    maximumAge: 5_000,
+                    timeout: 25_000
+                }
+            );
+
+            reenvioId = setInterval(() => {
+                if (ultimaPosicao) {
+                    enviarPosicao(ultimaPosicao);
+                }
+            }, INTERVALO_REENVIO);
+
+            botao.disabled = false;
+        }
+
+        async function parar() {
+            rastreamentoAtivo = false;
+            ultimaPosicao = null;
+
+            if (watchId !== null) {
+                navigator.geolocation.clearWatch(watchId);
+                watchId = null;
+            }
+
+            if (reenvioId !== null) {
+                clearInterval(reenvioId);
+                reenvioId = null;
+            }
+
+            if (wakeLock) {
+                try {
+                    await wakeLock.release();
+                } catch (_) {
+                    // Nenhuma ação necessária.
+                }
+                wakeLock = null;
+            }
+
+            botao.classList.remove('ativo');
+            botao.textContent = 'Ligar rastreamento';
+            mostrarStatus(
+                'Rastreamento desligado',
+                'O overlay desaparecerá após 60 segundos sem sinal.'
+            );
+        }
+
+        botao.addEventListener('click', () => {
+            if (rastreamentoAtivo) {
+                parar();
+            } else {
+                iniciar();
+            }
+        });
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible' && rastreamentoAtivo) {
+                manterTelaAcordada();
+                if (ultimaPosicao) enviarPosicao(ultimaPosicao);
+            }
+        });
+    </script>
+</body>
+</html>
