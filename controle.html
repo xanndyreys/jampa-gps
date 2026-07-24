@@ -129,9 +129,15 @@
         }
 
         ultimoEnvioEm = Date.now();
-        const temperatura = Number.isFinite(Number(dados.temperatura))
-          ? ` • ${Math.round(Number(dados.temperatura))}°C`
-          : '';
+        const temperaturaDisponivel =
+          dados.temperatura !== null &&
+          dados.temperatura !== undefined &&
+          dados.temperatura !== '';
+        const temperaturaNumero = Number(dados.temperatura);
+        const temperatura =
+          temperaturaDisponivel && Number.isFinite(temperaturaNumero)
+            ? ` • ${Math.round(temperaturaNumero)}°C`
+            : '';
 
         definirStatus(
           `✅ Enviado: ${dados.bairro || 'localização recebida'}${temperatura}`,
