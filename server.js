@@ -9,7 +9,7 @@ const PORT = Number(process.env.PORT) || 3000;
 const HOST = '0.0.0.0';
 const NOMINATIM_USER_AGENT =
   process.env.NOMINATIM_USER_AGENT ||
-  'JampaNaOrla2-GPS/2.0 (contato: canal Jampa na Orla 2)';
+  'JampaNaOrla2-GPS/2.2 (contato: canal Jampa na Orla 2)';
 
 const app = express();
 const server = http.createServer(app);
@@ -26,7 +26,6 @@ let cacheBairro = {
   bairro: null,
   timestamp: 0,
 };
-
 let cacheTemperatura = {
   latitude: null,
   longitude: null,
@@ -34,7 +33,7 @@ let cacheTemperatura = {
   timestamp: 0,
 };
 
-const CACHE_BAIRRO_MS = 30_000;
+const CACHE_BAIRRO_MS = 10 * 60_000;
 const CACHE_TEMPERATURA_MS = 10 * 60_000;
 const DISTANCIA_CACHE_BAIRRO_METROS = 80;
 const DISTANCIA_CACHE_TEMPERATURA_METROS = 2_000;
@@ -177,7 +176,6 @@ async function obterDadosLocalizacao(latitude, longitude) {
 
   const usarBairroCache =
     bairroPerto && agora - cacheBairro.timestamp < CACHE_BAIRRO_MS;
-
   const usarTemperaturaCache =
     temperaturaPerto &&
     agora - cacheTemperatura.timestamp < CACHE_TEMPERATURA_MS;
@@ -208,21 +206,11 @@ async function obterDadosLocalizacao(latitude, longitude) {
         : null;
 
   if (!usarBairroCache && bairroResultado.status === 'fulfilled') {
-    cacheBairro = {
-      latitude,
-      longitude,
-      bairro,
-      timestamp: agora,
-    };
+    cacheBairro = { latitude, longitude, bairro, timestamp: agora };
   }
 
   if (!usarTemperaturaCache && temperaturaResultado.status === 'fulfilled') {
-    cacheTemperatura = {
-      latitude,
-      longitude,
-      temperatura,
-      timestamp: agora,
-    };
+    cacheTemperatura = { latitude, longitude, temperatura, timestamp: agora };
   }
 
   if (bairroResultado.status === 'rejected') {
@@ -238,7 +226,6 @@ async function obterDadosLocalizacao(latitude, longitude) {
       temperaturaResultado.reason?.message || temperaturaResultado.reason,
     );
 
-    // Evita repetir imediatamente uma consulta já limitada pelo provedor.
     cacheTemperatura.timestamp = agora;
     cacheTemperatura.latitude = latitude;
     cacheTemperatura.longitude = longitude;
@@ -258,6 +245,7 @@ app.get('/controle', (_req, res) => {
 app.get('/status', (_req, res) => {
   enviarJson(res, 200, {
     status: 'online',
+    versao: '2.2',
     websocketClientes: wss.clients.size,
     ultimoPacote,
   });
@@ -265,7 +253,11 @@ app.get('/status', (_req, res) => {
 
 app.post(['/gps', '/api/gps', '/localizacao'], async (req, res) => {
   const latitude = numeroValido(req.body?.latitude ?? req.body?.lat, -90, 90);
-  const longitude = numeroValido(req.body?.longitude ?? req.body?.lon ?? req.body?.lng, -180, 180);
+  const longitude = numeroValido(
+    req.body?.longitude ?? req.body?.lon ?? req.body?.lng,
+    -180,
+    180,
+  );
 
   if (latitude === null || longitude === null) {
     return enviarJson(res, 400, {
@@ -275,7 +267,10 @@ app.post(['/gps', '/api/gps', '/localizacao'], async (req, res) => {
   }
 
   try {
-    const { bairro, temperatura } = await obterDadosLocalizacao(latitude, longitude);
+    const { bairro, temperatura } = await obterDadosLocalizacao(
+      latitude,
+      longitude,
+    );
 
     ultimoPacote = {
       tipo: 'localizacao',
@@ -300,6 +295,12 @@ app.post(['/gps', '/api/gps', '/localizacao'], async (req, res) => {
       mensagem: 'Não foi possível processar a localização.',
     });
   }
+});
+
+app.post('/parar', (_req, res) => {
+  ultimoPacote = null;
+  transmitir({ tipo: 'ocultar', recebidoEm: new Date().toISOString() });
+  enviarJson(res, 200, { status: 'sucesso' });
 });
 
 wss.on('connection', (socket) => {
@@ -327,5 +328,5 @@ wss.on('connection', (socket) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`Jampa GPS 2.0 online na porta ${PORT}`);
+  console.log(`Jampa GPS 2.2 online na porta ${PORT}`);
 });
