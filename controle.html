@@ -55,9 +55,9 @@
       cursor: pointer;
     }
 
-    button:disabled {
-      cursor: default;
-      opacity: 0.7;
+    button.desconectar {
+      background: #ff5d63;
+      color: #ffffff;
     }
 
     #status {
@@ -79,26 +79,32 @@
 <body>
   <main>
     <h1>📍 Jampa GPS</h1>
-    <p>Esta página envia somente latitude e longitude para o servidor.</p>
+    <p>Envia latitude e longitude para o servidor.</p>
     <p>Mantenha esta tela aberta durante a transmissão.</p>
 
-    <button id="botao" type="button">INICIAR GPS</button>
-    <div id="status">GPS ainda não iniciado.</div>
+    <button id="botao" type="button">INICIAR RASTREAMENTO</button>
+    <div id="status">Rastreamento desligado.</div>
     <div class="detalhe" id="detalhe"></div>
   </main>
 
   <script>
     'use strict';
 
-    const INTERVALO_MINIMO_ENVIO_MS = 5_000;
-    const DISTANCIA_MINIMA_METROS = 5;
+    const PAUSA_INICIAL_MS = 15_000;
+    const INTERVALO_MAXIMO_ENVIO_MS = 30_000;
+    const DISTANCIA_MINIMA_METROS = 20;
 
     const botao = document.getElementById('botao');
     const statusElemento = document.getElementById('status');
     const detalheElemento = document.getElementById('detalhe');
 
     let observadorGps = null;
+    let rastreamentoAtivo = false;
+    let primeiroEnvioConcluido = false;
+    let liberadoParaNovosEnviosEm = 0;
     let ultimoEnvioEm = 0;
+    let ultimaLatitudeEnviada = null;
+    let ultimaLongitudeEnviada = null;
     let envioEmAndamento = false;
     let ultimaPosicaoPendente = null;
 
@@ -107,7 +113,20 @@
       detalheElemento.textContent = detalhe;
     }
 
+    function distanciaEmMetros(lat1, lon1, lat2, lon2) {
+      const raioTerra = 6_371_000;
+      const rad = (graus) => (graus * Math.PI) / 180;
+      const dLat = rad(lat2 - lat1);
+      const dLon = rad(lon2 - lon1);
+      const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLon / 2) ** 2;
+      return 2 * raioTerra * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
     async function enviarPosicao(latitude, longitude, precisao) {
+      if (!rastreamentoAtivo) return;
+
       if (envioEmAndamento) {
         ultimaPosicaoPendente = { latitude, longitude, precisao };
         return;
@@ -123,50 +142,81 @@
         });
 
         const dados = await resposta.json().catch(() => ({}));
-
         if (!resposta.ok) {
           throw new Error(dados.mensagem || `HTTP ${resposta.status}`);
         }
 
-        ultimoEnvioEm = Date.now();
-        const temperaturaDisponivel =
+        const agora = Date.now();
+        ultimoEnvioEm = agora;
+        ultimaLatitudeEnviada = latitude;
+        ultimaLongitudeEnviada = longitude;
+
+        if (!primeiroEnvioConcluido) {
+          primeiroEnvioConcluido = true;
+          liberadoParaNovosEnviosEm = agora + PAUSA_INICIAL_MS;
+        }
+
+        const valorTemperatura = Number(dados.temperatura);
+        const temperatura =
           dados.temperatura !== null &&
           dados.temperatura !== undefined &&
-          dados.temperatura !== '';
-        const temperaturaNumero = Number(dados.temperatura);
-        const temperatura =
-          temperaturaDisponivel && Number.isFinite(temperaturaNumero)
-            ? ` • ${Math.round(temperaturaNumero)}°C`
+          dados.temperatura !== '' &&
+          Number.isFinite(valorTemperatura)
+            ? ` • ${Math.round(valorTemperatura)}°C`
             : '';
 
         definirStatus(
           `✅ Enviado: ${dados.bairro || 'localização recebida'}${temperatura}`,
-          `Precisão aproximada: ${Math.round(precisao)} m`,
+          primeiroEnvioConcluido && agora < liberadoParaNovosEnviosEm
+            ? 'Aguardando 15 segundos antes das próximas atualizações.'
+            : `Precisão aproximada: ${Math.round(precisao)} m`,
         );
       } catch (erro) {
         definirStatus('❌ Falha ao enviar GPS.', erro.message);
       } finally {
         envioEmAndamento = false;
 
-        if (ultimaPosicaoPendente) {
+        if (ultimaPosicaoPendente && rastreamentoAtivo) {
           const pendente = ultimaPosicaoPendente;
           ultimaPosicaoPendente = null;
-          enviarPosicao(pendente.latitude, pendente.longitude, pendente.precisao);
+          avaliarPosicao(pendente.latitude, pendente.longitude, pendente.precisao);
         }
+      }
+    }
+
+    function avaliarPosicao(latitude, longitude, precisao) {
+      if (!rastreamentoAtivo) return;
+
+      const agora = Date.now();
+      if (primeiroEnvioConcluido && agora < liberadoParaNovosEnviosEm) return;
+
+      if (!primeiroEnvioConcluido) {
+        enviarPosicao(latitude, longitude, precisao);
+        return;
+      }
+
+      const distancia =
+        Number.isFinite(ultimaLatitudeEnviada) &&
+        Number.isFinite(ultimaLongitudeEnviada)
+          ? distanciaEmMetros(
+              ultimaLatitudeEnviada,
+              ultimaLongitudeEnviada,
+              latitude,
+              longitude,
+            )
+          : Infinity;
+
+      const passouTempo = agora - ultimoEnvioEm >= INTERVALO_MAXIMO_ENVIO_MS;
+      const mudouPosicao = distancia >= DISTANCIA_MINIMA_METROS;
+
+      if (passouTempo || mudouPosicao) {
+        enviarPosicao(latitude, longitude, precisao);
       }
     }
 
     function aoReceberPosicao(posicao) {
       const { latitude, longitude, accuracy } = posicao.coords;
-      const agora = Date.now();
-
-      definirStatus(
-        '📡 GPS ativo. Enviando localização...',
-        `Precisão aproximada: ${Math.round(accuracy)} m`,
-      );
-
-      if (agora - ultimoEnvioEm < INTERVALO_MINIMO_ENVIO_MS) return;
-      enviarPosicao(latitude, longitude, accuracy);
+      avaliarPosicao(latitude, longitude, accuracy);
     }
 
     function aoFalharGps(erro) {
@@ -179,16 +229,24 @@
       definirStatus('❌ GPS não disponível.', mensagens[erro.code] || erro.message);
     }
 
-    function iniciarGps() {
+    function iniciarRastreamento() {
       if (!('geolocation' in navigator)) {
         definirStatus('❌ Este navegador não oferece GPS.');
         return;
       }
 
-      if (observadorGps !== null) return;
+      if (rastreamentoAtivo) return;
 
-      botao.disabled = true;
-      botao.textContent = 'GPS ATIVO';
+      rastreamentoAtivo = true;
+      primeiroEnvioConcluido = false;
+      liberadoParaNovosEnviosEm = 0;
+      ultimoEnvioEm = 0;
+      ultimaLatitudeEnviada = null;
+      ultimaLongitudeEnviada = null;
+      ultimaPosicaoPendente = null;
+
+      botao.textContent = 'DESCONECTAR';
+      botao.classList.add('desconectar');
       definirStatus('Solicitando permissão de localização...');
 
       observadorGps = navigator.geolocation.watchPosition(
@@ -196,16 +254,45 @@
         aoFalharGps,
         {
           enableHighAccuracy: true,
-          maximumAge: 2_000,
+          maximumAge: 3_000,
           timeout: 15_000,
         },
       );
     }
 
-    botao.addEventListener('click', iniciarGps);
+    async function desconectar() {
+      rastreamentoAtivo = false;
+
+      if (observadorGps !== null) {
+        navigator.geolocation.clearWatch(observadorGps);
+        observadorGps = null;
+      }
+
+      ultimaPosicaoPendente = null;
+      botao.textContent = 'INICIAR RASTREAMENTO';
+      botao.classList.remove('desconectar');
+      definirStatus('Rastreamento desligado.', 'O overlay foi ocultado.');
+
+      try {
+        await fetch('/parar', { method: 'POST' });
+      } catch (_erro) {
+        definirStatus(
+          'Rastreamento desligado.',
+          'O GPS foi interrompido, mas o servidor não confirmou o comando.',
+        );
+      }
+    }
+
+    botao.addEventListener('click', () => {
+      if (rastreamentoAtivo) {
+        desconectar();
+      } else {
+        iniciarRastreamento();
+      }
+    });
 
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden && observadorGps !== null) {
+      if (!document.hidden && rastreamentoAtivo) {
         navigator.geolocation.getCurrentPosition(
           aoReceberPosicao,
           aoFalharGps,
