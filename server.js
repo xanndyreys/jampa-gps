@@ -20,16 +20,24 @@ app.use(express.urlencoded({ extended: false, limit: '20kb' }));
 app.use(express.static(__dirname));
 
 let ultimoPacote = null;
-let ultimaConsulta = {
+let cacheBairro = {
   latitude: null,
   longitude: null,
   bairro: null,
+  timestamp: 0,
+};
+
+let cacheTemperatura = {
+  latitude: null,
+  longitude: null,
   temperatura: null,
   timestamp: 0,
 };
 
-const CACHE_MS = 20_000;
-const DISTANCIA_CACHE_METROS = 80;
+const CACHE_BAIRRO_MS = 30_000;
+const CACHE_TEMPERATURA_MS = 10 * 60_000;
+const DISTANCIA_CACHE_BAIRRO_METROS = 80;
+const DISTANCIA_CACHE_TEMPERATURA_METROS = 2_000;
 
 function enviarJson(res, status, payload) {
   res.status(status).json(payload);
@@ -146,56 +154,95 @@ function transmitir(payload) {
 
 async function obterDadosLocalizacao(latitude, longitude) {
   const agora = Date.now();
-  const cacheTemCoordenadas =
-    Number.isFinite(ultimaConsulta.latitude) &&
-    Number.isFinite(ultimaConsulta.longitude);
 
-  const pertoDoCache = cacheTemCoordenadas
-    ? distanciaEmMetros(
-        ultimaConsulta.latitude,
-        ultimaConsulta.longitude,
-        latitude,
-        longitude,
-      ) <= DISTANCIA_CACHE_METROS
-    : false;
+  const bairroPerto =
+    Number.isFinite(cacheBairro.latitude) &&
+    Number.isFinite(cacheBairro.longitude) &&
+    distanciaEmMetros(
+      cacheBairro.latitude,
+      cacheBairro.longitude,
+      latitude,
+      longitude,
+    ) <= DISTANCIA_CACHE_BAIRRO_METROS;
 
-  if (pertoDoCache && agora - ultimaConsulta.timestamp < CACHE_MS) {
-    return {
-      bairro: ultimaConsulta.bairro,
-      temperatura: ultimaConsulta.temperatura,
-    };
-  }
+  const temperaturaPerto =
+    Number.isFinite(cacheTemperatura.latitude) &&
+    Number.isFinite(cacheTemperatura.longitude) &&
+    distanciaEmMetros(
+      cacheTemperatura.latitude,
+      cacheTemperatura.longitude,
+      latitude,
+      longitude,
+    ) <= DISTANCIA_CACHE_TEMPERATURA_METROS;
+
+  const usarBairroCache =
+    bairroPerto && agora - cacheBairro.timestamp < CACHE_BAIRRO_MS;
+
+  const usarTemperaturaCache =
+    temperaturaPerto &&
+    agora - cacheTemperatura.timestamp < CACHE_TEMPERATURA_MS;
+
+  const bairroPromessa = usarBairroCache
+    ? Promise.resolve(cacheBairro.bairro)
+    : buscarBairro(latitude, longitude);
+
+  const temperaturaPromessa = usarTemperaturaCache
+    ? Promise.resolve(cacheTemperatura.temperatura)
+    : buscarTemperatura(latitude, longitude);
 
   const [bairroResultado, temperaturaResultado] = await Promise.allSettled([
-    buscarBairro(latitude, longitude),
-    buscarTemperatura(latitude, longitude),
+    bairroPromessa,
+    temperaturaPromessa,
   ]);
 
   const bairro =
     bairroResultado.status === 'fulfilled'
       ? bairroResultado.value
-      : ultimaConsulta.bairro || 'Localização atual';
+      : cacheBairro.bairro || 'Localização atual';
 
   const temperatura =
     temperaturaResultado.status === 'fulfilled'
       ? temperaturaResultado.value
-      : null;
+      : Number.isFinite(cacheTemperatura.temperatura)
+        ? cacheTemperatura.temperatura
+        : null;
+
+  if (!usarBairroCache && bairroResultado.status === 'fulfilled') {
+    cacheBairro = {
+      latitude,
+      longitude,
+      bairro,
+      timestamp: agora,
+    };
+  }
+
+  if (!usarTemperaturaCache && temperaturaResultado.status === 'fulfilled') {
+    cacheTemperatura = {
+      latitude,
+      longitude,
+      temperatura,
+      timestamp: agora,
+    };
+  }
 
   if (bairroResultado.status === 'rejected') {
-    console.error('[Nominatim]', bairroResultado.reason?.message || bairroResultado.reason);
+    console.error(
+      '[Nominatim]',
+      bairroResultado.reason?.message || bairroResultado.reason,
+    );
   }
 
   if (temperaturaResultado.status === 'rejected') {
-    console.error('[Open-Meteo]', temperaturaResultado.reason?.message || temperaturaResultado.reason);
-  }
+    console.error(
+      '[Open-Meteo]',
+      temperaturaResultado.reason?.message || temperaturaResultado.reason,
+    );
 
-  ultimaConsulta = {
-    latitude,
-    longitude,
-    bairro,
-    temperatura,
-    timestamp: agora,
-  };
+    // Evita repetir imediatamente uma consulta já limitada pelo provedor.
+    cacheTemperatura.timestamp = agora;
+    cacheTemperatura.latitude = latitude;
+    cacheTemperatura.longitude = longitude;
+  }
 
   return { bairro, temperatura };
 }
