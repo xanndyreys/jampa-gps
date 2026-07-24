@@ -3,16 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Jampa GPS 2.0</title>
+  <title>Jampa GPS 2.2</title>
   <style>
-    :root {
-      color-scheme: dark;
-      --fonte-principal: Arial, Helvetica, sans-serif;
-    }
-
-    * {
-      box-sizing: border-box;
-    }
+    * { box-sizing: border-box; }
 
     html,
     body {
@@ -25,28 +18,27 @@
 
     body {
       display: flex;
-      align-items: flex-end;
+      align-items: flex-start;
       justify-content: flex-start;
-      padding: clamp(18px, 3vw, 56px);
-      font-family: var(--fonte-principal);
+      padding: 32px 36px;
+      font-family: Arial, Helvetica, sans-serif;
     }
 
     #painel {
       display: inline-flex;
       align-items: center;
-      gap: clamp(22px, 3vw, 54px);
-      max-width: calc(100vw - 36px);
-      padding: 14px 22px;
+      gap: 34px;
+      max-width: calc(100vw - 72px);
       opacity: 0;
-      transform: translateY(14px);
-      transition: opacity 700ms ease, transform 700ms ease;
+      transform: translateY(-10px);
+      transition: opacity 650ms ease, transform 650ms ease;
       pointer-events: none;
       white-space: nowrap;
       text-shadow:
-        0 3px 3px rgba(0, 0, 0, 0.98),
-        0 0 8px rgba(0, 0, 0, 0.98),
-        0 0 18px rgba(0, 0, 0, 0.95);
-      filter: drop-shadow(0 3px 3px rgba(0, 0, 0, 0.9));
+        0 2px 2px rgba(0, 0, 0, 1),
+        0 0 7px rgba(0, 0, 0, 1),
+        0 0 14px rgba(0, 0, 0, 0.95);
+      filter: drop-shadow(0 2px 2px rgba(0, 0, 0, 0.95));
     }
 
     #painel.visivel {
@@ -57,13 +49,13 @@
     .grupo {
       display: inline-flex;
       align-items: center;
-      gap: clamp(8px, 1vw, 16px);
+      gap: 10px;
       min-width: 0;
     }
 
     .icone {
       flex: 0 0 auto;
-      font-size: clamp(56px, 5.2vw, 76px);
+      font-size: 38px;
       line-height: 1;
     }
 
@@ -72,10 +64,10 @@
       overflow: hidden;
       text-overflow: ellipsis;
       color: #ffffff;
-      font-size: clamp(54px, 5vw, 68px);
+      font-size: 42px;
       font-weight: 800;
-      line-height: 1;
-      letter-spacing: -1.5px;
+      line-height: 1.05;
+      letter-spacing: -0.5px;
     }
 
     #temperaturaGrupo[hidden] {
@@ -83,29 +75,19 @@
     }
 
     @media (max-width: 760px) {
-      body {
-        padding: 18px;
-      }
-
+      body { padding: 20px; }
       #painel {
-        gap: 18px;
-        padding: 10px 12px;
+        gap: 20px;
+        max-width: calc(100vw - 40px);
       }
-
-      .icone {
-        font-size: clamp(38px, 9vw, 58px);
-      }
-
-      .texto {
-        font-size: clamp(36px, 8.5vw, 58px);
-        letter-spacing: -0.8px;
-      }
+      .icone { font-size: 30px; }
+      .texto { font-size: 32px; }
     }
   </style>
 </head>
 <body>
   <div id="painel" aria-live="polite">
-    <div class="grupo" id="bairroGrupo">
+    <div class="grupo">
       <span class="icone" aria-hidden="true">📍</span>
       <span class="texto" id="bairro">Localização atual</span>
     </div>
@@ -119,7 +101,7 @@
   <script>
     'use strict';
 
-    const ATRASO_EXIBICAO_MS = 15_000;
+    const ATRASO_INICIAL_MS = 15_000;
     const TEMPO_SEM_GPS_MS = 60_000;
 
     const painel = document.getElementById('painel');
@@ -128,39 +110,30 @@
     const temperaturaElemento = document.getElementById('temperatura');
 
     let socket = null;
-    let temporizadorExibicao = null;
+    let temporizadorInicial = null;
     let temporizadorOcultar = null;
-    let reconexao = null;
-    let ultimoDado = null;
+    let temporizadorReconexao = null;
+    let primeiroPacotePendente = null;
+    let painelJaFoiExibido = false;
 
     function urlWebSocket() {
       const protocolo = location.protocol === 'https:' ? 'wss:' : 'ws:';
       return `${protocolo}//${location.host}`;
     }
 
-    function cancelarTemporizadores() {
-      clearTimeout(temporizadorExibicao);
-      clearTimeout(temporizadorOcultar);
-      temporizadorExibicao = null;
-      temporizadorOcultar = null;
-    }
-
-    function ocultarPainel() {
-      painel.classList.remove('visivel');
-    }
-
     function preencherPainel(dado) {
       const bairro = typeof dado.bairro === 'string' ? dado.bairro.trim() : '';
       bairroElemento.textContent = bairro || 'Localização atual';
 
-      const temperaturaDisponivel =
+      const valor = Number(dado.temperatura);
+      const disponivel =
         dado.temperatura !== null &&
         dado.temperatura !== undefined &&
-        dado.temperatura !== '';
-      const temperatura = Number(dado.temperatura);
+        dado.temperatura !== '' &&
+        Number.isFinite(valor);
 
-      if (temperaturaDisponivel && Number.isFinite(temperatura)) {
-        temperaturaElemento.textContent = `${Math.round(temperatura)}°C`;
+      if (disponivel) {
+        temperaturaElemento.textContent = `${Math.round(valor)}°C`;
         temperaturaGrupo.hidden = false;
       } else {
         temperaturaElemento.textContent = '';
@@ -168,36 +141,62 @@
       }
     }
 
-    function agendarExibicao(dado) {
-      ultimoDado = dado;
-      cancelarTemporizadores();
-      ocultarPainel();
-
-      temporizadorExibicao = setTimeout(() => {
-        preencherPainel(ultimoDado);
-        painel.classList.add('visivel');
-      }, ATRASO_EXIBICAO_MS);
-
+    function renovarTempoDeVida() {
+      clearTimeout(temporizadorOcultar);
       temporizadorOcultar = setTimeout(() => {
-        ocultarPainel();
+        painel.classList.remove('visivel');
+        painelJaFoiExibido = false;
+        primeiroPacotePendente = null;
       }, TEMPO_SEM_GPS_MS);
     }
 
+    function receberLocalizacao(dado) {
+      renovarTempoDeVida();
+
+      if (painelJaFoiExibido) {
+        preencherPainel(dado);
+        return;
+      }
+
+      primeiroPacotePendente = dado;
+      if (temporizadorInicial) return;
+
+      temporizadorInicial = setTimeout(() => {
+        preencherPainel(primeiroPacotePendente);
+        painel.classList.add('visivel');
+        painelJaFoiExibido = true;
+        temporizadorInicial = null;
+      }, ATRASO_INICIAL_MS);
+    }
+
+    function ocultarTudo() {
+      clearTimeout(temporizadorInicial);
+      clearTimeout(temporizadorOcultar);
+      temporizadorInicial = null;
+      temporizadorOcultar = null;
+      primeiroPacotePendente = null;
+      painelJaFoiExibido = false;
+      painel.classList.remove('visivel');
+    }
+
     function conectar() {
-      clearTimeout(reconexao);
+      clearTimeout(temporizadorReconexao);
 
       try {
         socket = new WebSocket(urlWebSocket());
-      } catch (erro) {
-        reconexao = setTimeout(conectar, 3000);
+      } catch (_erro) {
+        temporizadorReconexao = setTimeout(conectar, 3000);
         return;
       }
 
       socket.addEventListener('message', (evento) => {
         try {
           const dado = JSON.parse(evento.data);
+
           if (dado?.tipo === 'localizacao' && dado.bairro) {
-            agendarExibicao(dado);
+            receberLocalizacao(dado);
+          } else if (dado?.tipo === 'ocultar') {
+            ocultarTudo();
           }
         } catch (erro) {
           console.error('Mensagem WebSocket inválida:', erro);
@@ -205,8 +204,8 @@
       });
 
       socket.addEventListener('close', () => {
-        ocultarPainel();
-        reconexao = setTimeout(conectar, 3000);
+        ocultarTudo();
+        temporizadorReconexao = setTimeout(conectar, 3000);
       });
 
       socket.addEventListener('error', () => {
