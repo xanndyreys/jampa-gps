@@ -3,423 +3,282 @@
 const express = require('express');
 const http = require('http');
 const path = require('path');
-const WebSocket = require('ws');
+const { WebSocketServer, WebSocket } = require('ws');
+
+const PORT = Number(process.env.PORT) || 3000;
+const HOST = '0.0.0.0';
+const NOMINATIM_USER_AGENT =
+  process.env.NOMINATIM_USER_AGENT ||
+  'JampaNaOrla2-GPS/2.0 (contato: canal Jampa na Orla 2)';
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocketServer({ server });
 
-const PORT = process.env.PORT || 3939;
-
-const ATRASO_PARA_EXIBIR = 15_000;
-const LIMITE_SEM_SINAL = 60_000;
-const INTERVALO_VERIFICACAO = 1_000;
-const INTERVALO_HEARTBEAT = 30_000;
-
-const TEMPO_CACHE_GEOCODIFICACAO = 30_000;
-const DISTANCIA_CACHE_METROS = 80;
-const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/reverse';
-
-app.disable('x-powered-by');
 app.use(express.json({ limit: '20kb' }));
-app.use(express.urlencoded({ extended: false }));
+app.use(express.urlencoded({ extended: false, limit: '20kb' }));
+app.use(express.static(__dirname));
 
-app.use(
-    express.static(path.join(__dirname), {
-        etag: false,
-        lastModified: false,
-        setHeaders(res) {
-            res.setHeader(
-                'Cache-Control',
-                'no-store, no-cache, must-revalidate, proxy-revalidate'
-            );
-            res.setHeader('Pragma', 'no-cache');
-            res.setHeader('Expires', '0');
-        }
-    })
-);
-
-let estadoAtual = {
-    bairro: '',
-    temperatura: ''
+let ultimoPacote = null;
+let ultimaConsulta = {
+  latitude: null,
+  longitude: null,
+  bairro: null,
+  temperatura: null,
+  timestamp: 0,
 };
 
-let ultimaLeituraDoCelular = 0;
-let telaVisivelNoObs = false;
-let temporizadorExibicao = null;
+const CACHE_MS = 20_000;
+const DISTANCIA_CACHE_METROS = 80;
 
-let cacheGeocodificacao = {
-    lat: null,
-    lon: null,
-    bairro: '',
-    cidade: '',
-    timestamp: 0
-};
-
-function obterValor(req, nome) {
-    if (req.body && req.body[nome] !== undefined) {
-        return req.body[nome];
-    }
-
-    if (req.query && req.query[nome] !== undefined) {
-        return req.query[nome];
-    }
-
-    return undefined;
+function enviarJson(res, status, payload) {
+  res.status(status).json(payload);
 }
 
-function enviar(client, dados) {
-    if (client.readyState !== WebSocket.OPEN) {
-        return;
-    }
-
-    try {
-        client.send(JSON.stringify(dados));
-    } catch (erro) {
-        console.error('[WebSocket] Falha no envio:', erro.message);
-    }
+function numeroValido(valor, minimo, maximo) {
+  const numero = Number(valor);
+  return Number.isFinite(numero) && numero >= minimo && numero <= maximo
+    ? numero
+    : null;
 }
 
-function broadcast(dados) {
-    for (const client of wss.clients) {
-        enviar(client, dados);
+function distanciaEmMetros(lat1, lon1, lat2, lon2) {
+  const raioTerra = 6_371_000;
+  const rad = (graus) => (graus * Math.PI) / 180;
+  const dLat = rad(lat2 - lat1);
+  const dLon = rad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return raioTerra * c;
+}
+
+function limparNomeLocal(valor) {
+  if (typeof valor !== 'string') return null;
+
+  const limpo = valor
+    .replace(/\s*\/\s*.*/u, '')
+    .replace(/\s*,\s*.*/u, '')
+    .replace(/^bairro\s+/iu, '')
+    .trim();
+
+  return limpo || null;
+}
+
+function escolherBairro(address = {}) {
+  const candidatos = [
+    address.neighbourhood,
+    address.suburb,
+    address.quarter,
+    address.residential,
+    address.city_district,
+    address.hamlet,
+    address.village,
+    address.town,
+    address.city,
+  ];
+
+  for (const candidato of candidatos) {
+    const bairro = limparNomeLocal(candidato);
+    if (bairro) return bairro;
+  }
+
+  return 'Localização atual';
+}
+
+async function buscarBairro(latitude, longitude) {
+  const url = new URL('https://nominatim.openstreetmap.org/reverse');
+  url.searchParams.set('format', 'jsonv2');
+  url.searchParams.set('lat', latitude.toFixed(7));
+  url.searchParams.set('lon', longitude.toFixed(7));
+  url.searchParams.set('zoom', '18');
+  url.searchParams.set('addressdetails', '1');
+  url.searchParams.set('accept-language', 'pt-BR');
+
+  const resposta = await fetch(url, {
+    headers: {
+      'User-Agent': NOMINATIM_USER_AGENT,
+      Accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!resposta.ok) {
+    throw new Error(`Nominatim respondeu HTTP ${resposta.status}`);
+  }
+
+  const dados = await resposta.json();
+  return escolherBairro(dados.address);
+}
+
+async function buscarTemperatura(latitude, longitude) {
+  const url = new URL('https://api.open-meteo.com/v1/forecast');
+  url.searchParams.set('latitude', latitude.toFixed(7));
+  url.searchParams.set('longitude', longitude.toFixed(7));
+  url.searchParams.set('current', 'temperature_2m');
+  url.searchParams.set('timezone', 'America/Fortaleza');
+  url.searchParams.set('forecast_days', '1');
+
+  const resposta = await fetch(url, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!resposta.ok) {
+    throw new Error(`Open-Meteo respondeu HTTP ${resposta.status}`);
+  }
+
+  const dados = await resposta.json();
+  const temperatura = Number(dados?.current?.temperature_2m);
+  return Number.isFinite(temperatura) ? Math.round(temperatura) : null;
+}
+
+function transmitir(payload) {
+  const mensagem = JSON.stringify(payload);
+
+  for (const cliente of wss.clients) {
+    if (cliente.readyState === WebSocket.OPEN) {
+      cliente.send(mensagem);
     }
+  }
 }
 
-function calcularDistanciaMetros(lat1, lon1, lat2, lon2) {
-    const raioTerra = 6_371_000;
-    const paraRadianos = graus => (graus * Math.PI) / 180;
+async function obterDadosLocalizacao(latitude, longitude) {
+  const agora = Date.now();
+  const cacheTemCoordenadas =
+    Number.isFinite(ultimaConsulta.latitude) &&
+    Number.isFinite(ultimaConsulta.longitude);
 
-    const deltaLat = paraRadianos(lat2 - lat1);
-    const deltaLon = paraRadianos(lon2 - lon1);
+  const pertoDoCache = cacheTemCoordenadas
+    ? distanciaEmMetros(
+        ultimaConsulta.latitude,
+        ultimaConsulta.longitude,
+        latitude,
+        longitude,
+      ) <= DISTANCIA_CACHE_METROS
+    : false;
 
-    const a =
-        Math.sin(deltaLat / 2) ** 2 +
-        Math.cos(paraRadianos(lat1)) *
-            Math.cos(paraRadianos(lat2)) *
-            Math.sin(deltaLon / 2) ** 2;
+  if (pertoDoCache && agora - ultimaConsulta.timestamp < CACHE_MS) {
+    return {
+      bairro: ultimaConsulta.bairro,
+      temperatura: ultimaConsulta.temperatura,
+    };
+  }
 
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return raioTerra * c;
+  const [bairroResultado, temperaturaResultado] = await Promise.allSettled([
+    buscarBairro(latitude, longitude),
+    buscarTemperatura(latitude, longitude),
+  ]);
+
+  const bairro =
+    bairroResultado.status === 'fulfilled'
+      ? bairroResultado.value
+      : ultimaConsulta.bairro || 'Localização atual';
+
+  const temperatura =
+    temperaturaResultado.status === 'fulfilled'
+      ? temperaturaResultado.value
+      : null;
+
+  if (bairroResultado.status === 'rejected') {
+    console.error('[Nominatim]', bairroResultado.reason?.message || bairroResultado.reason);
+  }
+
+  if (temperaturaResultado.status === 'rejected') {
+    console.error('[Open-Meteo]', temperaturaResultado.reason?.message || temperaturaResultado.reason);
+  }
+
+  ultimaConsulta = {
+    latitude,
+    longitude,
+    bairro,
+    temperatura,
+    timestamp: agora,
+  };
+
+  return { bairro, temperatura };
 }
 
-function selecionarBairro(address = {}) {
-    return (
-        address.suburb ||
-        address.neighbourhood ||
-        address.quarter ||
-        address.city_district ||
-        address.residential ||
-        ''
-    );
-}
+app.get('/', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
 
-function selecionarCidade(address = {}) {
-    return (
-        address.city ||
-        address.town ||
-        address.village ||
-        address.municipality ||
-        address.county ||
-        'João Pessoa'
-    );
-}
+app.get('/controle', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'controle.html'));
+});
 
-function cacheGeocodificacaoValido(lat, lon) {
-    if (
-        !Number.isFinite(cacheGeocodificacao.lat) ||
-        !Number.isFinite(cacheGeocodificacao.lon) ||
-        !cacheGeocodificacao.bairro
-    ) {
-        return false;
-    }
+app.get('/status', (_req, res) => {
+  enviarJson(res, 200, {
+    status: 'online',
+    websocketClientes: wss.clients.size,
+    ultimoPacote,
+  });
+});
 
-    const cacheAindaRecente =
-        Date.now() - cacheGeocodificacao.timestamp <=
-        TEMPO_CACHE_GEOCODIFICACAO;
+app.post(['/gps', '/api/gps', '/localizacao'], async (req, res) => {
+  const latitude = numeroValido(req.body?.latitude ?? req.body?.lat, -90, 90);
+  const longitude = numeroValido(req.body?.longitude ?? req.body?.lon ?? req.body?.lng, -180, 180);
 
-    if (!cacheAindaRecente) {
-        return false;
-    }
+  if (latitude === null || longitude === null) {
+    return enviarJson(res, 400, {
+      status: 'erro',
+      mensagem: 'Latitude ou longitude inválida.',
+    });
+  }
 
-    const distancia = calcularDistanciaMetros(
-        cacheGeocodificacao.lat,
-        cacheGeocodificacao.lon,
-        lat,
-        lon
-    );
+  try {
+    const { bairro, temperatura } = await obterDadosLocalizacao(latitude, longitude);
 
-    return distancia <= DISTANCIA_CACHE_METROS;
-}
-
-async function identificarLocalPorGPS(lat, lon) {
-    if (cacheGeocodificacaoValido(lat, lon)) {
-        return {
-            bairro: cacheGeocodificacao.bairro,
-            cidade: cacheGeocodificacao.cidade
-        };
-    }
-
-    const url = new URL(NOMINATIM_URL);
-    url.searchParams.set('format', 'jsonv2');
-    url.searchParams.set('lat', String(lat));
-    url.searchParams.set('lon', String(lon));
-    url.searchParams.set('zoom', '18');
-    url.searchParams.set('addressdetails', '1');
-    url.searchParams.set('accept-language', 'pt-BR');
-
-    const controlador = new AbortController();
-    const timeout = setTimeout(() => controlador.abort(), 8_000);
-
-    try {
-        const resposta = await fetch(url, {
-            headers: {
-                'User-Agent': 'JampaGPS/1.0 (OBS overlay de geolocalizacao)'
-            },
-            signal: controlador.signal
-        });
-
-        if (!resposta.ok) {
-            throw new Error(`Nominatim respondeu HTTP ${resposta.status}`);
-        }
-
-        const dados = await resposta.json();
-        const address = dados.address || {};
-
-        const bairro = selecionarBairro(address);
-        const cidade = selecionarCidade(address);
-        const localFinal = bairro || cidade || 'João Pessoa';
-
-        cacheGeocodificacao = {
-            lat,
-            lon,
-            bairro: localFinal,
-            cidade,
-            timestamp: Date.now()
-        };
-
-        return {
-            bairro: localFinal,
-            cidade
-        };
-    } finally {
-        clearTimeout(timeout);
-    }
-}
-
-function cancelarTemporizadorExibicao() {
-    if (temporizadorExibicao) {
-        clearTimeout(temporizadorExibicao);
-        temporizadorExibicao = null;
-    }
-}
-
-function limparTela(motivo) {
-    cancelarTemporizadorExibicao();
-
-    telaVisivelNoObs = false;
-    ultimaLeituraDoCelular = 0;
-    estadoAtual = {
-        bairro: '',
-        temperatura: ''
+    ultimoPacote = {
+      tipo: 'localizacao',
+      bairro,
+      temperatura,
+      latitude,
+      longitude,
+      recebidoEm: new Date().toISOString(),
     };
 
-    broadcast({
-        tipo: 'LIMPAR_TELA',
-        bairro: '',
-        temperatura: ''
+    transmitir(ultimoPacote);
+
+    return enviarJson(res, 200, {
+      status: 'sucesso',
+      bairro,
+      temperatura,
     });
-
-    console.log(`[Servidor] Tela limpa: ${motivo}.`);
-}
-
-function iniciarAtrasoDeExibicao() {
-    if (temporizadorExibicao || telaVisivelNoObs) {
-        return;
-    }
-
-    console.log(
-        '[Celular] Primeiro sinal válido. Aguardando exatamente 15 segundos.'
-    );
-
-    temporizadorExibicao = setTimeout(() => {
-        temporizadorExibicao = null;
-
-        const sinalAindaValido =
-            ultimaLeituraDoCelular > 0 &&
-            Date.now() - ultimaLeituraDoCelular <= LIMITE_SEM_SINAL;
-
-        if (!sinalAindaValido || !estadoAtual.bairro) {
-            limparTela('sinal inválido durante a estabilização');
-            return;
-        }
-
-        telaVisivelNoObs = true;
-
-        broadcast({
-            tipo: 'ATUALIZAR',
-            bairro: estadoAtual.bairro,
-            temperatura: estadoAtual.temperatura
-        });
-
-        console.log(
-            `[Servidor] Exibindo após 15 segundos: ${estadoAtual.bairro} | ${estadoAtual.temperatura}`
-        );
-    }, ATRASO_PARA_EXIBIR);
-}
-
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'online',
-        obsConectados: [...wss.clients].filter(
-            client => client.readyState === WebSocket.OPEN
-        ).length,
-        celularAtivo:
-            ultimaLeituraDoCelular > 0 &&
-            Date.now() - ultimaLeituraDoCelular <= LIMITE_SEM_SINAL,
-        telaVisivelNoObs,
-        bairro: telaVisivelNoObs ? estadoAtual.bairro : '',
-        temperatura: telaVisivelNoObs ? estadoAtual.temperatura : ''
+  } catch (erro) {
+    console.error('[GPS]', erro);
+    return enviarJson(res, 500, {
+      status: 'erro',
+      mensagem: 'Não foi possível processar a localização.',
     });
+  }
 });
 
-app.all('/api/atualizar', async (req, res) => {
-    const lat = Number.parseFloat(obterValor(req, 'lat'));
-    const lon = Number.parseFloat(obterValor(req, 'lon'));
-    const temperaturaRecebida = obterValor(req, 'temperatura');
+wss.on('connection', (socket) => {
+  console.log('[WebSocket] Cliente conectado. Total:', wss.clients.size);
 
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-        console.log(
-            '[Celular] Requisição rejeitada: coordenadas ausentes ou inválidas.'
-        );
+  socket.send(
+    JSON.stringify({
+      tipo: 'conexao',
+      status: 'conectado',
+      servidorEm: new Date().toISOString(),
+    }),
+  );
 
-        return res.status(400).json({
-            status: 'erro',
-            mensagem: 'Coordenadas inválidas'
-        });
-    }
+  if (ultimoPacote) {
+    socket.send(JSON.stringify(ultimoPacote));
+  }
 
-    ultimaLeituraDoCelular = Date.now();
+  socket.on('close', () => {
+    console.log('[WebSocket] Cliente desconectado. Total:', wss.clients.size);
+  });
 
-    try {
-        const local = await identificarLocalPorGPS(lat, lon);
-        const bairroAnterior = estadoAtual.bairro;
-
-        estadoAtual.bairro = local.bairro || local.cidade || 'João Pessoa';
-
-        if (
-            temperaturaRecebida !== undefined &&
-            temperaturaRecebida !== null &&
-            String(temperaturaRecebida).trim() !== ''
-        ) {
-            estadoAtual.temperatura = String(temperaturaRecebida).trim();
-        }
-
-        console.log(
-            `[Celular] Sinal recebido: lat=${lat}, lon=${lon}, bairro=${estadoAtual.bairro}, temp=${estadoAtual.temperatura}`
-        );
-
-        iniciarAtrasoDeExibicao();
-
-        if (telaVisivelNoObs && bairroAnterior !== estadoAtual.bairro) {
-            broadcast({
-                tipo: 'ATUALIZAR',
-                bairro: estadoAtual.bairro,
-                temperatura: estadoAtual.temperatura
-            });
-        }
-
-        return res.json({
-            status: 'sucesso',
-            bairro: estadoAtual.bairro,
-            temperatura: estadoAtual.temperatura,
-            telaVisivel: telaVisivelNoObs
-        });
-    } catch (erro) {
-        console.error('[Geolocalização] Falha:', erro.message);
-
-        estadoAtual.bairro = estadoAtual.bairro || 'João Pessoa';
-
-        iniciarAtrasoDeExibicao();
-
-        if (telaVisivelNoObs) {
-            broadcast({
-                tipo: 'ATUALIZAR',
-                bairro: estadoAtual.bairro,
-                temperatura: estadoAtual.temperatura
-            });
-        }
-
-        return res.json({
-            status: 'sucesso_com_fallback',
-            bairro: estadoAtual.bairro,
-            temperatura: estadoAtual.temperatura,
-            telaVisivel: telaVisivelNoObs
-        });
-    }
+  socket.on('error', (erro) => {
+    console.error('[WebSocket]', erro.message);
+  });
 });
 
-setInterval(() => {
-    if (ultimaLeituraDoCelular === 0) {
-        return;
-    }
-
-    if (Date.now() - ultimaLeituraDoCelular > LIMITE_SEM_SINAL) {
-        limparTela('mais de 60 segundos sem sinal do celular');
-    }
-}, INTERVALO_VERIFICACAO);
-
-wss.on('connection', ws => {
-    console.log('[WebSocket] OBS conectado.');
-    ws.isAlive = true;
-
-    ws.on('pong', () => {
-        ws.isAlive = true;
-    });
-
-    ws.on('message', mensagem => {
-        ws.isAlive = true;
-
-        if (mensagem.toString() === 'PING') {
-            enviar(ws, {
-                tipo: 'PONG',
-                timestamp: Date.now()
-            });
-        }
-    });
-
-    ws.on('close', () => {
-        console.log('[WebSocket] OBS desconectado.');
-    });
-
-    ws.on('error', erro => {
-        console.error('[WebSocket] Erro:', erro.message);
-    });
-
-    enviar(ws, {
-        tipo: 'STATUS',
-        bairro: telaVisivelNoObs ? estadoAtual.bairro : '',
-        temperatura: telaVisivelNoObs ? estadoAtual.temperatura : ''
-    });
-});
-
-const heartbeat = setInterval(() => {
-    for (const ws of wss.clients) {
-        if (ws.isAlive === false) {
-            console.log('[WebSocket] Conexão sem resposta encerrada.');
-            ws.terminate();
-            continue;
-        }
-
-        ws.isAlive = false;
-        ws.ping();
-    }
-}, INTERVALO_HEARTBEAT);
-
-wss.on('close', () => {
-    clearInterval(heartbeat);
-});
-
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Servidor] Jampa GPS rodando na porta ${PORT}.`);
+server.listen(PORT, HOST, () => {
+  console.log(`Jampa GPS 2.0 online na porta ${PORT}`);
 });
