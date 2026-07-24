@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>Jampa GPS para OBS</title>
+
+    <style>
+        html,
+        body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            overflow: hidden;
+            background: transparent;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            color: #ffffff;
+        }
+
+        #localizacao {
+            display: none;
+            align-items: center;
+            gap: 10px;
+            font-size: 24px;
+            font-weight: 700;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
+        }
+    </style>
+</head>
+<body>
+    <div id="localizacao">
+        <span>📍</span>
+        <span id="bairro"></span>
+        <span id="icone-temperatura">🌡️</span>
+        <span id="temperatura"></span>
+    </div>
+
+    <script>
+        'use strict';
+
+        const URL_RENDER = 'wss://jampa-gps.onrender.com';
+        const container = document.getElementById('localizacao');
+        const campoBairro = document.getElementById('bairro');
+        const campoTemperatura = document.getElementById('temperatura');
+        const iconeTemperatura = document.getElementById('icone-temperatura');
+
+        let socket = null;
+        let reconexaoId = null;
+        let pingId = null;
+        let vigilanciaId = null;
+        let ultimaResposta = 0;
+
+        function esconderTudo() {
+            container.style.display = 'none';
+            campoBairro.textContent = '';
+            campoTemperatura.textContent = '';
+            iconeTemperatura.style.display = 'none';
+        }
+
+        function mostrarDados(bairro, temperatura) {
+            const bairroSeguro = typeof bairro === 'string' ? bairro.trim() : '';
+            const temperaturaSegura =
+                typeof temperatura === 'string' ? temperatura.trim() : '';
+
+            if (!bairroSeguro && !temperaturaSegura) {
+                esconderTudo();
+                return;
+            }
+
+            campoBairro.textContent = bairroSeguro;
+            campoTemperatura.textContent = temperaturaSegura;
+            iconeTemperatura.style.display = temperaturaSegura ? 'inline' : 'none';
+            container.style.display = 'flex';
+        }
+
+        function obterUrlWebSocket() {
+            if (window.location.protocol === 'https:') {
+                return `wss://${window.location.host}`;
+            }
+
+            if (window.location.protocol === 'http:') {
+                return `ws://${window.location.host}`;
+            }
+
+            // Proteção adicional caso o arquivo seja aberto localmente no OBS.
+            return URL_RENDER;
+        }
+
+        function pararTemporizadores() {
+            if (pingId) {
+                clearInterval(pingId);
+                pingId = null;
+            }
+
+            if (vigilanciaId) {
+                clearInterval(vigilanciaId);
+                vigilanciaId = null;
+            }
+        }
+
+        function agendarReconexao() {
+            if (reconexaoId) {
+                return;
+            }
+
+            reconexaoId = setTimeout(() => {
+                reconexaoId = null;
+                conectar();
+            }, 3000);
+        }
+
+        function iniciarVigilancia() {
+            pararTemporizadores();
+
+            pingId = setInterval(() => {
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send('PING');
+                }
+            }, 20_000);
+
+            vigilanciaId = setInterval(() => {
+                if (!socket || !ultimaResposta) {
+                    return;
+                }
+
+                if (Date.now() - ultimaResposta > 50_000) {
+                    socket.close();
+                }
+            }, 5_000);
+        }
+
+        function conectar() {
+            if (
+                socket &&
+                (socket.readyState === WebSocket.OPEN ||
+                 socket.readyState === WebSocket.CONNECTING)
+            ) {
+                return;
+            }
+
+            const url = obterUrlWebSocket();
+            console.log('[OBS] Conectando em:', url);
+            socket = new WebSocket(url);
+
+            socket.onopen = () => {
+                console.log('[OBS] WebSocket conectado.');
+                ultimaResposta = Date.now();
+                socket.send('PING');
+                iniciarVigilancia();
+            };
+
+            socket.onmessage = event => {
+                ultimaResposta = Date.now();
+
+                try {
+                    const dados = JSON.parse(event.data);
+
+                    if (dados.tipo === 'PONG') {
+                        return;
+                    }
+
+                    if (dados.tipo === 'LIMPAR_TELA') {
+                        esconderTudo();
+                        return;
+                    }
+
+                    if (
+                        dados.tipo === 'STATUS' ||
+                        dados.tipo === 'MOSTRAR' ||
+                        dados.tipo === 'ATUALIZAR'
+                    ) {
+                        mostrarDados(dados.bairro, dados.temperatura);
+                    }
+                } catch (erro) {
+                    console.error('[OBS] Mensagem inválida:', erro);
+                }
+            };
+
+            socket.onerror = erro => {
+                console.error('[OBS] Erro WebSocket:', erro);
+                try {
+                    socket.close();
+                } catch (_) {
+                    agendarReconexao();
+                }
+            };
+
+            socket.onclose = () => {
+                console.log('[OBS] Desconectado. Reconectando em 3 segundos.');
+                pararTemporizadores();
+                socket = null;
+                esconderTudo();
+                agendarReconexao();
+            };
+        }
+
+        esconderTudo();
+        conectar();
+    </script>
+</body>
+</html>
