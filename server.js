@@ -9,7 +9,7 @@ const PORT = Number(process.env.PORT) || 3000;
 const HOST = '0.0.0.0';
 const NOMINATIM_USER_AGENT =
   process.env.NOMINATIM_USER_AGENT ||
-  'JampaNaOrla2-GPS/2.2 (contato: canal Jampa na Orla 2)';
+  'JampaNaOrla2-GPS/2.3 (contato: canal Jampa na Orla 2)';
 
 const app = express();
 const server = http.createServer(app);
@@ -34,7 +34,7 @@ let cacheTemperatura = {
 };
 
 const CACHE_BAIRRO_MS = 10 * 60_000;
-const CACHE_TEMPERATURA_MS = 10 * 60_000;
+const CACHE_TEMPERATURA_MS = 15 * 60_000;
 const DISTANCIA_CACHE_BAIRRO_METROS = 80;
 const DISTANCIA_CACHE_TEMPERATURA_METROS = 2_000;
 
@@ -120,24 +120,29 @@ async function buscarBairro(latitude, longitude) {
 }
 
 async function buscarTemperatura(latitude, longitude) {
-  const url = new URL('https://api.open-meteo.com/v1/forecast');
-  url.searchParams.set('latitude', latitude.toFixed(7));
-  url.searchParams.set('longitude', longitude.toFixed(7));
-  url.searchParams.set('current', 'temperature_2m');
-  url.searchParams.set('timezone', 'America/Fortaleza');
-  url.searchParams.set('forecast_days', '1');
+  const url = new URL(
+    'https://api.met.no/weatherapi/locationforecast/2.0/compact',
+  );
+  url.searchParams.set('lat', latitude.toFixed(4));
+  url.searchParams.set('lon', longitude.toFixed(4));
 
   const resposta = await fetch(url, {
-    headers: { Accept: 'application/json' },
+    headers: {
+      'User-Agent': NOMINATIM_USER_AGENT,
+      Accept: 'application/json',
+    },
     signal: AbortSignal.timeout(10_000),
   });
 
   if (!resposta.ok) {
-    throw new Error(`Open-Meteo respondeu HTTP ${resposta.status}`);
+    throw new Error(`MET Norway respondeu HTTP ${resposta.status}`);
   }
 
   const dados = await resposta.json();
-  const temperatura = Number(dados?.current?.temperature_2m);
+  const temperatura = Number(
+    dados?.properties?.timeseries?.[0]?.data?.instant?.details?.air_temperature,
+  );
+
   return Number.isFinite(temperatura) ? Math.round(temperatura) : null;
 }
 
@@ -222,7 +227,7 @@ async function obterDadosLocalizacao(latitude, longitude) {
 
   if (temperaturaResultado.status === 'rejected') {
     console.error(
-      '[Open-Meteo]',
+      '[MET Norway]',
       temperaturaResultado.reason?.message || temperaturaResultado.reason,
     );
 
@@ -245,7 +250,7 @@ app.get('/controle', (_req, res) => {
 app.get('/status', (_req, res) => {
   enviarJson(res, 200, {
     status: 'online',
-    versao: '2.2',
+    versao: '2.3',
     websocketClientes: wss.clients.size,
     ultimoPacote,
   });
@@ -328,5 +333,5 @@ wss.on('connection', (socket) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`Jampa GPS 2.2 online na porta ${PORT}`);
+  console.log(`Jampa GPS 2.3 online na porta ${PORT}`);
 });
